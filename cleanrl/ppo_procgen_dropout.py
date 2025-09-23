@@ -1,131 +1,19 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_procgenpy
 import os
 import random
 import time
 from dataclasses import dataclass
 
-import gymnasium as gym
-from gymnasium import Wrapper
+import gym
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn.modules import padding
 import torch.optim as optim
 import tyro
-from torch.distributions.normal import Normal
+from procgen import ProcgenEnv
+from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-
-
-RIGHT_GOAL = 0.45
-LEFT_GOAL = -1.5
-
-class MountainCarGoalWrapper(Wrapper):
-    def __init__(self, env, goal_position, min_position=-1.65):
-        super().__init__(env)
-        self.goal_position = float(goal_position)
-        self.min_position = float(min_position)
-        # Ensure the underlying env uses the new goal
-        self.env.unwrapped.goal_position = self.goal_position
-        self.env.unwrapped.min_position = self.min_position
-
-    def reset(self, **kwargs):
-        # Re-apply in case the env resets internal parameters
-        self.env.unwrapped.goal_position = self.goal_position
-        self.env.unwrapped.min_position = self.min_position
-        return self.env.reset(**kwargs)
-
-    def step(self, action):
-        observation, reward, terminated, truncated, info = self.env.step(action)
-        # observation[0] is the position in MountainCarContinuous-v0
-        position = float(observation[0])
-        # New termination: agent position >= abs(goal_position)
-        terminated = bool(position >= abs(self.goal_position))
-        return observation, reward, terminated, truncated, info
-
-
-class MountainCarObservationWithGoalDistance(Wrapper):
-    def __init__(self, env, absolute_distance=True, max_episode_steps=2000):
-        super().__init__(env)
-        self.absolute_distance = bool(absolute_distance)
-        self._desired_max_steps = int(max_episode_steps)
-        self._step_count = 0
-
-        # Try to update any internal TimeLimit wrapper to extend truncation horizon
-        walker = self.env
-        try:
-            while True:
-                if hasattr(walker, "_max_episode_steps"):
-                    walker._max_episode_steps = self._desired_max_steps
-                    break
-                if hasattr(walker, "env"):
-                    walker = walker.env
-                else:
-                    break
-        except Exception:
-            # If anything goes wrong, we still enforce via local counter below
-            pass
-
-        # Determine bounds for the additional distance feature
-        goal = float(getattr(self.env.unwrapped, "goal_position"))
-        min_pos = float(getattr(self.env.unwrapped, "min_position"))
-        max_pos = float(getattr(self.env.unwrapped, "max_position"))
-        max_dist = max(abs(max_pos - goal), abs(min_pos - goal))
-
-        # Extend observation space by one dimension
-        assert isinstance(self.env.observation_space, gym.spaces.Box)
-        orig_space = self.env.observation_space
-        if self.absolute_distance:
-            extra_low = np.array([0.0], dtype=orig_space.dtype)
-            extra_high = np.array([max_dist], dtype=orig_space.dtype)
-        else:
-            # Signed distance can be negative or positive
-            extra_low = np.array([-max_dist], dtype=orig_space.dtype)
-            extra_high = np.array([max_dist], dtype=orig_space.dtype)
-
-        low = np.concatenate([orig_space.low, extra_low])
-        high = np.concatenate([orig_space.high, extra_high])
-        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=orig_space.dtype)
-
-    def _augment_observation(self, observation):
-        position = float(observation[0])
-        goal = float(getattr(self.env.unwrapped, "goal_position"))
-        if self.absolute_distance:
-            distance = abs(position - goal)
-        else:
-            distance = position - goal
-        return np.concatenate([observation, np.array([distance], dtype=self.observation_space.dtype)])
-
-    def reset(self, **kwargs):
-        self._step_count = 0
-        observation, info = self.env.reset(**kwargs)
-        return self._augment_observation(observation), info
-
-    def step(self, action):
-        observation, reward, terminated, truncated, info = self.env.step(action)
-        # Fallback enforcement: extend episode up to desired max steps if inner TimeLimit wasn't updated
-        self._step_count += 1
-        if not terminated and not truncated and self._step_count >= self._desired_max_steps:
-            truncated = True
-        return self._augment_observation(observation), reward, terminated, truncated, info
-
-
-class MountainCarRewardDistancePenalty(Wrapper):
-    def __init__(self, env, penalty_coef=0.1, absolute_distance=True):
-        super().__init__(env)
-        self.penalty_coef = float(penalty_coef)
-        self.absolute_distance = bool(absolute_distance)
-
-    def _distance_to_goal(self, observation):
-        position = float(observation[0])
-        goal = float(getattr(self.env.unwrapped, "goal_position"))
-        if self.absolute_distance:
-            return abs(position - goal)
-        return position - goal
-
-    def step(self, action):
-        observation, reward, terminated, truncated, info = self.env.step(action)
-        distance = self._distance_to_goal(observation)
-        reward = reward - self.penalty_coef * abs(distance)
-        return observation, reward, terminated, truncated, info
 
 
 @dataclass
@@ -146,33 +34,27 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
-    upload_model: bool = False
-    """whether to upload the saved model to huggingface"""
-    hf_entity: str = ""
-    """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "MountainCarContinuous-v0"
+    env_id: str = "starpilot"
     """the id of the environment"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = int(25e6)
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-4
+    learning_rate: float = 5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 4
+    num_envs: int = 64
     """the number of parallel game environments"""
-    num_steps: int = 1024
+    num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
-    anneal_lr: bool = True
+    anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.99
+    gamma: float = 0.999
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 32
+    num_minibatches: int = 8
     """the number of mini-batches"""
-    update_epochs: int = 20
+    update_epochs: int = 3
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
@@ -180,7 +62,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.01
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -198,65 +80,79 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, run_name, gamma, goal_position):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        # env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        # env = gym.wrappers.ClipAction(env)
-        # env = gym.wrappers.NormalizeObservation(env)
-        # env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        
-        env = MountainCarGoalWrapper(env, goal_position=goal_position)
-        env = MountainCarObservationWithGoalDistance(env, absolute_distance=True)
-        # env = MountainCarRewardDistancePenalty(env, penalty_coef=0.5, absolute_distance=True)
-        return env
-
-    return thunk
-
-
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv0 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        inputs = x
+        x = nn.functional.relu(x)
+        x = self.conv0(x)
+        x = nn.functional.relu(x)
+        x = self.conv1(x)
+        return x + inputs
+
+
+class ConvSequence(nn.Module):
+    def __init__(self, input_shape, out_channels):
+        super().__init__()
+        self._input_shape = input_shape
+        self._out_channels = out_channels
+        self.conv = nn.Conv2d(in_channels=self._input_shape[0], out_channels=self._out_channels, kernel_size=3, padding=1)
+        self.res_block0 = ResidualBlock(self._out_channels)
+        self.res_block1 = ResidualBlock(self._out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = nn.functional.max_pool2d(x, kernel_size=3, stride=2, padding=1)
+        x = self.res_block0(x)
+        x = self.res_block1(x)
+        assert x.shape[1:] == self.get_output_shape()
+        return x
+
+    def get_output_shape(self):
+        _c, h, w = self._input_shape
+        return (self._out_channels, (h + 1) // 2, (w + 1) // 2)
+
+
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
-        )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+        h, w, c = envs.single_observation_space.shape
+        shape = (c, h, w)
+        conv_seqs = []
+        for out_channels in [16, 32, 32]:
+            conv_seq = ConvSequence(shape, out_channels)
+            shape = conv_seq.get_output_shape()
+            conv_seqs.append(conv_seq)
+        conv_seqs += [
+            nn.Flatten(),
+            nn.ReLU(),
+            nn.Linear(in_features=shape[0] * shape[1] * shape[2], out_features=256),
+            nn.ReLU(),
+        ]
+        self.network = nn.Sequential(*conv_seqs)
+        self.actor = layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(256, 1), std=1)
 
     def get_value(self, x):
-        return self.critic(x)
+        return self.critic(self.network(x.permute((0, 3, 1, 2)) / 255.0))
 
     def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        hidden = self.network(x.permute((0, 3, 2, 1)) / 255.0)
+        logits = self.actor(hidden)
+        probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
 
 if __name__ == "__main__":
@@ -292,10 +188,17 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma, RIGHT_GOAL) for i in range(args.num_envs)]
-    )
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    envs = ProcgenEnv(num_envs=args.num_envs, env_name=args.env_id, num_levels=0, start_level=0, distribution_mode="easy")
+    envs = gym.wrappers.TransformObservation(envs, lambda obs: obs["rgb"])
+    envs.single_action_space = envs.action_space
+    envs.single_observation_space = envs.observation_space["rgb"]
+    envs.is_vector_env = True
+    envs = gym.wrappers.RecordEpisodeStatistics(envs)
+    if args.capture_video:
+        envs = gym.wrappers.RecordVideo(envs, f"videos/{run_name}")
+    envs = gym.wrappers.NormalizeReward(envs, gamma=args.gamma)
+    envs = gym.wrappers.TransformReward(envs, lambda reward: np.clip(reward, -10, 10))
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -311,8 +214,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
+    next_obs = torch.Tensor(envs.reset()).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
@@ -335,17 +237,16 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
-            next_done = np.logical_or(terminations, truncations)
+            next_obs, reward, next_done, info = envs.step(action.cpu().numpy())
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+            for item in info:
+                if "episode" in item.keys():
+                    print(f"global_step={global_step}, episodic_return={item['episode']['r']}")
+                    writer.add_scalar("charts/episodic_return", item["episode"]["r"], global_step)
+                    writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
+                    break
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -380,7 +281,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -440,34 +341,6 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
-    if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-        torch.save(agent.state_dict(), model_path)
-        print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.ppo_eval import evaluate
-
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=Agent,
-            device=device,
-            gamma=args.gamma,
-            goal_position=RIGHT_GOAL,
-            capture_video=False,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
-
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
-
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
     writer.close()

@@ -16,7 +16,7 @@ def evaluate(
     gamma: float = 0.99,
     goal_position: float = -1000,
 ):
-    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, capture_video, run_name, gamma, goal_position)])
+    envs = gym.vector.SyncVectorEnv([make_env(env_id, 1, 0, capture_video, run_name, goal_position)])
     agent = Model(envs).to(device)
     agent.load_state_dict(torch.load(model_path, map_location=device))
     agent.eval()
@@ -24,8 +24,10 @@ def evaluate(
     obs, _ = envs.reset()
     episodic_returns = []
     while len(episodic_returns) < eval_episodes:
-        actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
-        next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
+        actions, _, _ = agent.get_action(torch.Tensor(obs).to(device))
+        # actions = actions.detach().cpu().numpy()
+        # actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
+        next_obs, _, _, _, infos = envs.step(actions.detach().cpu().numpy())
         if "final_info" in infos:
             for info in infos["final_info"]:
                 if "episode" not in info:

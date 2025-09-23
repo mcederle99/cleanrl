@@ -1,131 +1,35 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
 import os
 import random
 import time
 from dataclasses import dataclass
 
 import gymnasium as gym
-from gymnasium import Wrapper
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 
-RIGHT_GOAL = 0.45
-LEFT_GOAL = -1.5
+class CustomDropout(nn.Module):
+    def __init__(self, p):
+        super().__init__()
+        self.p = p
+        self.mask = None
 
-class MountainCarGoalWrapper(Wrapper):
-    def __init__(self, env, goal_position, min_position=-1.65):
-        super().__init__(env)
-        self.goal_position = float(goal_position)
-        self.min_position = float(min_position)
-        # Ensure the underlying env uses the new goal
-        self.env.unwrapped.goal_position = self.goal_position
-        self.env.unwrapped.min_position = self.min_position
+    def forward(self, x):
+        if self.training:
+            return x * self.mask / (1 - self.p)
+        return x
 
-    def reset(self, **kwargs):
-        # Re-apply in case the env resets internal parameters
-        self.env.unwrapped.goal_position = self.goal_position
-        self.env.unwrapped.min_position = self.min_position
-        return self.env.reset(**kwargs)
+    def set_mask(self, mask):
+        self.mask = mask
 
-    def step(self, action):
-        observation, reward, terminated, truncated, info = self.env.step(action)
-        # observation[0] is the position in MountainCarContinuous-v0
-        position = float(observation[0])
-        # New termination: agent position >= abs(goal_position)
-        terminated = bool(position >= abs(self.goal_position))
-        return observation, reward, terminated, truncated, info
-
-
-class MountainCarObservationWithGoalDistance(Wrapper):
-    def __init__(self, env, absolute_distance=True, max_episode_steps=2000):
-        super().__init__(env)
-        self.absolute_distance = bool(absolute_distance)
-        self._desired_max_steps = int(max_episode_steps)
-        self._step_count = 0
-
-        # Try to update any internal TimeLimit wrapper to extend truncation horizon
-        walker = self.env
-        try:
-            while True:
-                if hasattr(walker, "_max_episode_steps"):
-                    walker._max_episode_steps = self._desired_max_steps
-                    break
-                if hasattr(walker, "env"):
-                    walker = walker.env
-                else:
-                    break
-        except Exception:
-            # If anything goes wrong, we still enforce via local counter below
-            pass
-
-        # Determine bounds for the additional distance feature
-        goal = float(getattr(self.env.unwrapped, "goal_position"))
-        min_pos = float(getattr(self.env.unwrapped, "min_position"))
-        max_pos = float(getattr(self.env.unwrapped, "max_position"))
-        max_dist = max(abs(max_pos - goal), abs(min_pos - goal))
-
-        # Extend observation space by one dimension
-        assert isinstance(self.env.observation_space, gym.spaces.Box)
-        orig_space = self.env.observation_space
-        if self.absolute_distance:
-            extra_low = np.array([0.0], dtype=orig_space.dtype)
-            extra_high = np.array([max_dist], dtype=orig_space.dtype)
-        else:
-            # Signed distance can be negative or positive
-            extra_low = np.array([-max_dist], dtype=orig_space.dtype)
-            extra_high = np.array([max_dist], dtype=orig_space.dtype)
-
-        low = np.concatenate([orig_space.low, extra_low])
-        high = np.concatenate([orig_space.high, extra_high])
-        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=orig_space.dtype)
-
-    def _augment_observation(self, observation):
-        position = float(observation[0])
-        goal = float(getattr(self.env.unwrapped, "goal_position"))
-        if self.absolute_distance:
-            distance = abs(position - goal)
-        else:
-            distance = position - goal
-        return np.concatenate([observation, np.array([distance], dtype=self.observation_space.dtype)])
-
-    def reset(self, **kwargs):
-        self._step_count = 0
-        observation, info = self.env.reset(**kwargs)
-        return self._augment_observation(observation), info
-
-    def step(self, action):
-        observation, reward, terminated, truncated, info = self.env.step(action)
-        # Fallback enforcement: extend episode up to desired max steps if inner TimeLimit wasn't updated
-        self._step_count += 1
-        if not terminated and not truncated and self._step_count >= self._desired_max_steps:
-            truncated = True
-        return self._augment_observation(observation), reward, terminated, truncated, info
-
-
-class MountainCarRewardDistancePenalty(Wrapper):
-    def __init__(self, env, penalty_coef=0.1, absolute_distance=True):
-        super().__init__(env)
-        self.penalty_coef = float(penalty_coef)
-        self.absolute_distance = bool(absolute_distance)
-
-    def _distance_to_goal(self, observation):
-        position = float(observation[0])
-        goal = float(getattr(self.env.unwrapped, "goal_position"))
-        if self.absolute_distance:
-            return abs(position - goal)
-        return position - goal
-
-    def step(self, action):
-        observation, reward, terminated, truncated, info = self.env.step(action)
-        distance = self._distance_to_goal(observation)
-        reward = reward - self.penalty_coef * abs(distance)
-        return observation, reward, terminated, truncated, info
+    def get_mask(self):
+        return self.mask if self.mask is not None else torch.tensor([])
 
 
 @dataclass
@@ -154,15 +58,15 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "MountainCarContinuous-v0"
+    env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 4
+    num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 1024
+    num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -172,7 +76,7 @@ class Args:
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 32
     """the number of mini-batches"""
-    update_epochs: int = 20
+    update_epochs: int = 10
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
@@ -198,24 +102,20 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, run_name, gamma, goal_position):
+def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        # env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
+        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        # env = gym.wrappers.ClipAction(env)
-        # env = gym.wrappers.NormalizeObservation(env)
-        # env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        
-        env = MountainCarGoalWrapper(env, goal_position=goal_position)
-        env = MountainCarObservationWithGoalDistance(env, absolute_distance=True)
-        # env = MountainCarRewardDistancePenalty(env, penalty_coef=0.5, absolute_distance=True)
+        env = gym.wrappers.ClipAction(env)
+        env = gym.wrappers.NormalizeObservation(env)
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
 
     return thunk
@@ -237,20 +137,30 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
-        )
+        # self.actor_mean = nn.Sequential(
+        #     layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+        #     nn.Tanh(),
+        #     layer_init(nn.Linear(64, 64)),
+        #     nn.Tanh(),
+        #     layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
+        # )
+        self.actor_mean_l1 = layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64))
+        self.actor_mean_d1 = CustomDropout(0.1)
+        self.actor_mean_l2 = layer_init(nn.Linear(64, 64))
+        self.actor_mean_d2 = CustomDropout(0.1)
+        self.actor_mean_l3 = layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01)
+        
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
+        action_mean = self.actor_mean_d1(torch.tanh(self.actor_mean_l1(x)))
+        action_mean = self.actor_mean_d2(torch.tanh(self.actor_mean_l2(action_mean)))
+        action_mean = self.actor_mean_l3(action_mean)
+        # action_mean = self.actor_mean(x)
+        
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
@@ -293,14 +203,14 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma, RIGHT_GOAL) for i in range(args.num_envs)]
+        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # ALGO Logic: Storage setup
+    # ALGO Logic: Storage setup, i.e. memory
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -316,7 +226,12 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
-        # Annealing the rate if instructed to do so.
+        current_mask1 = (torch.rand(64, device=device) > 0.1).float()
+        current_mask2 = (torch.rand(64, device=device) > 0.1).float()
+        agent.actor_mean_d1.set_mask(current_mask1)
+        agent.actor_mean_d2.set_mask(current_mask2)
+
+        # Annealing the lr if instructed to do so
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
@@ -327,14 +242,14 @@ if __name__ == "__main__":
             obs[step] = next_obs
             dones[step] = next_done
 
-            # ALGO LOGIC: action logic
+            # ALGO Logic: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
-            # TRY NOT TO MODIFY: execute the game and log data.
+            # TRY NOT TO MODIFY: execute the game and log data
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
@@ -371,7 +286,7 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # Optimizing the policy and value network
+        # optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -385,7 +300,7 @@ if __name__ == "__main__":
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    # calculate approx_kl
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -394,12 +309,12 @@ if __name__ == "__main__":
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss
+                # policy loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss
+                # value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
@@ -455,9 +370,8 @@ if __name__ == "__main__":
             run_name=f"{run_name}-eval",
             Model=Agent,
             device=device,
-            gamma=args.gamma,
-            goal_position=RIGHT_GOAL,
             capture_video=False,
+            gamma=args.gamma,
         )
         for idx, episodic_return in enumerate(episodic_returns):
             writer.add_scalar("eval/episodic_return", episodic_return, idx)

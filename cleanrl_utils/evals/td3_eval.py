@@ -13,10 +13,11 @@ def evaluate(
     run_name: str,
     Model: nn.Module,
     device: torch.device = torch.device("cpu"),
-    capture_video: bool = True,
+    capture_video: bool = False,
     exploration_noise: float = 0.1,
+    goal_position: float = -1000,
 ):
-    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name)])
+    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name, goal_position)])
     actor = Model[0](envs).to(device)
     qf1 = Model[1](envs).to(device)
     qf2 = Model[1](envs).to(device)
