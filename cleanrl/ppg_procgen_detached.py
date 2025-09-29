@@ -3,7 +3,6 @@ import os
 import random
 import time
 from dataclasses import dataclass
-import copy
 
 import gym
 import numpy as np
@@ -187,34 +186,29 @@ class Agent(nn.Module):
             encodertop,
             nn.ReLU(),
         ]
-        self.network_actor_aux = nn.Sequential(*conv_seqs)
-        self.network_critic = nn.Sequential(*copy.deepcopy(conv_seqs))
+        self.network = nn.Sequential(*conv_seqs)
         self.actor = layer_init_normed(nn.Linear(256, envs.single_action_space.n), norm_dim=1, scale=0.1)
         self.critic = layer_init_normed(nn.Linear(256, 1), norm_dim=1, scale=0.1)
         self.aux_critic = layer_init_normed(nn.Linear(256, 1), norm_dim=1, scale=0.1)
 
     def get_action_and_value(self, x, action=None):
-        hidden = self.network_actor_aux(x.permute((0, 3, 1, 2)) / 255.0)  # "bhwc" -> "bchw"
+        hidden = self.network(x.permute((0, 3, 1, 2)) / 255.0)  # "bhwc" -> "bchw"
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-
-        hidden_critic = self.network_critic(x.permute((0, 3, 1, 2)) / 255.0)  # "bhwc" -> "bchw"
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden_critic)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden.detach())
 
     def get_value(self, x):
-        return self.critic(self.network_critic(x.permute((0, 3, 1, 2)) / 255.0))  # "bhwc" -> "bchw"
+        return self.critic(self.network(x.permute((0, 3, 1, 2)) / 255.0))  # "bhwc" -> "bchw"
 
     # PPG logic:
     def get_pi_value_and_aux_value(self, x):
-        hidden = self.network_actor_aux(x.permute((0, 3, 1, 2)) / 255.0)
-
-        hidden_critic = self.network_critic(x.permute((0, 3, 1, 2)) / 255.0)  # "bhwc" -> "bchw"
-        return Categorical(logits=self.actor(hidden)), self.critic(hidden_critic), self.aux_critic(hidden)
+        hidden = self.network(x.permute((0, 3, 1, 2)) / 255.0)
+        return Categorical(logits=self.actor(hidden)), self.critic(hidden), self.aux_critic(hidden)
 
     def get_pi(self, x):
-        return Categorical(logits=self.actor(self.network_actor_aux(x.permute((0, 3, 1, 2)) / 255.0)))
+        return Categorical(logits=self.actor(self.network(x.permute((0, 3, 1, 2)) / 255.0)))
 
 
 if __name__ == "__main__":
@@ -268,15 +262,7 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)
-
-    # Separate optimizers for actor (policy + aux value) and critic (value)
-    actor_params = list(agent.network_actor_aux.parameters()) + list(agent.actor.parameters()) + list(
-        agent.aux_critic.parameters()
-    )
-    critic_params = list(agent.network_critic.parameters()) + list(agent.critic.parameters())
-
-    optimizer_actor = optim.Adam(actor_params, lr=args.learning_rate, eps=1e-8)
-    optimizer_critic = optim.Adam(critic_params, lr=args.learning_rate, eps=1e-8)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-8)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -304,8 +290,7 @@ if __name__ == "__main__":
             if args.anneal_lr:
                 frac = 1.0 - (update - 1.0) / args.num_iterations
                 lrnow = frac * args.learning_rate
-                optimizer_actor.param_groups[0]["lr"] = lrnow
-                optimizer_critic.param_groups[0]["lr"] = lrnow
+                optimizer.param_groups[0]["lr"] = lrnow
 
             for step in range(0, args.num_steps):
                 global_step += 1 * args.num_envs
@@ -351,8 +336,13 @@ if __name__ == "__main__":
             b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
             b_logprobs = logprobs.reshape(-1)
             b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+            b_advantages = advantages.reshape(-1)
             b_returns = returns.reshape(-1)
             b_values = values.reshape(-1)
+
+            # PPG code does full batch advantage normalization
+            if args.adv_norm_fullbatch:
+                b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
             # Optimizing the policy and value network
             b_inds = np.arange(args.batch_size)
@@ -363,9 +353,24 @@ if __name__ == "__main__":
                     end = start + args.minibatch_size
                     mb_inds = b_inds[start:end]
 
-                    # Value loss
-                    newvalue = agent.get_value(b_obs[mb_inds])
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                    logratio = newlogprob - b_logprobs[mb_inds]
+                    ratio = logratio.exp()
 
+                    with torch.no_grad():
+                        # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                        old_approx_kl = (-logratio).mean()
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
+                    mb_advantages = b_advantages[mb_inds]
+
+                    # Policy loss
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    # Value loss
                     newvalue = newvalue.view(-1)
                     if args.clip_vloss:
                         v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
@@ -380,67 +385,13 @@ if __name__ == "__main__":
                     else:
                         v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                    optimizer_critic.zero_grad()
-                    v_loss.backward()
-                    nn.utils.clip_grad_norm_(critic_params, args.max_grad_norm)
-                    optimizer_critic.step()
-
-                # bootstrap value if not done
-                with torch.no_grad():
-                    # Evaluate critic on b_obs in minibatches to avoid huge single conv pass
-                    flat_values = torch.zeros(args.batch_size, device=device)
-                    for start in range(0, args.batch_size, args.minibatch_size):
-                        end = start + args.minibatch_size
-                        flat_values[start:end] = agent.get_value(b_obs[start:end]).view(-1)
-                    values = flat_values.view(args.num_steps, args.num_envs)
-
-                    next_value = agent.get_value(next_obs).reshape(1, -1)
-                    advantages = torch.zeros_like(rewards).to(device)
-                    lastgaelam = 0
-                    for t in reversed(range(args.num_steps)):
-                        if t == args.num_steps - 1:
-                            nextnonterminal = 1.0 - next_done
-                            nextvalues = next_value
-                        else:
-                            nextnonterminal = 1.0 - dones[t + 1]
-                            nextvalues = values[t + 1]
-                        delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                        advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                    # returns = advantages + values DA PROVARE SIA COMMENTATA CHE NO
-
-                b_advantages = advantages.reshape(-1)
-                # PPG code does full batch advantage normalization
-                if args.adv_norm_fullbatch:
-                    b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
-
-                for start in range(0, args.batch_size, args.minibatch_size):
-                    end = start + args.minibatch_size
-                    mb_inds = b_inds[start:end]
-
-                    # Policy loss
-                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
-                    logratio = newlogprob - b_logprobs[mb_inds]
-                    ratio = logratio.exp()
-
-                    with torch.no_grad():
-                        # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                        old_approx_kl = (-logratio).mean()
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
-                    mb_advantages = b_advantages[mb_inds]
-
-                    pg_loss1 = -mb_advantages * ratio
-                    pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
                     entropy_loss = entropy.mean()
-                    loss = pg_loss - args.ent_coef * entropy_loss #  + v_loss * args.vf_coef
+                    loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                    optimizer_actor.zero_grad()
+                    optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(actor_params, args.max_grad_norm)
-                    optimizer_actor.step()
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    optimizer.step()
 
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     break
@@ -450,7 +401,7 @@ if __name__ == "__main__":
             explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
             # TRY NOT TO MODIFY: record rewards for plotting purposes
-            writer.add_scalar("charts/learning_rate", optimizer_actor.param_groups[0]["lr"], global_step)
+            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
             writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
             writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
             writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -511,12 +462,9 @@ if __name__ == "__main__":
                     loss.backward()
 
                     if (i + 1) % args.n_aux_grad_accum == 0:
-                        nn.utils.clip_grad_norm_(actor_params, args.max_grad_norm)
-                        nn.utils.clip_grad_norm_(critic_params, args.max_grad_norm)
-                        optimizer_actor.step()
-                        optimizer_critic.step()
-                        optimizer_actor.zero_grad()  # This cannot be outside, else gradients won't accumulate
-                        optimizer_critic.zero_grad()
+                        nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad()  # This cannot be outside, else gradients won't accumulate
 
                 except RuntimeError as e:
                     raise Exception(

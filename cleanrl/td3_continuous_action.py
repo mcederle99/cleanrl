@@ -170,7 +170,7 @@ def make_env(env_id, seed, idx, capture_video, run_name, goal_position):
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id, render_mode="human") # TO REMOVE RENDER MODE
+            env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
         env = MountainCarGoalWrapper(env, goal_position=goal_position)

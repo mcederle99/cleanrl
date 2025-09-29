@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import os
 import cleanrl.sac_continuous_action
 import cleanrl.td3_continuous_action
+import cleanrl.ppo_continuous_action
 
 
 RIGHT_GOAL = 0.45
@@ -153,4 +154,68 @@ episodic_returns = evaluate_td3(
     device=device,
     exploration_noise=td3_args.exploration_noise,
     goal_position=LEFT_GOAL,
+)
+
+
+@dataclass
+class Ppo_Args:
+    exp_name: str = "ppo_continuous_action"
+    """the name of this experiment"""
+    seed: int = 1
+    """seed of the experiment"""
+    env_id: str = "MountainCarContinuous-v0"
+    """the id of the environment"""
+    gamma: float = 0.99
+    """the discount factor gamma"""
+
+
+def evaluate_ppo(
+    model_path: str,
+    make_env: Callable,
+    env_id: str,
+    eval_episodes: int,
+    run_name: str,
+    Model: torch.nn.Module,
+    device: torch.device = torch.device("cpu"),
+    capture_video: bool = False,
+    gamma: float = 0.99,
+    goal_position: float = -1000,
+):
+    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, capture_video, run_name, gamma, goal_position)])
+    agent = Model(envs).to(device)
+    agent.load_state_dict(torch.load(model_path, map_location=device))
+    agent.eval()
+
+    obs, _ = envs.reset()
+    episodic_returns = []
+    while len(episodic_returns) < eval_episodes:
+        actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
+        next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                if "episode" not in info:
+                    continue
+                print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
+                episodic_returns += [info["episode"]["r"]]
+        obs = next_obs
+
+    return episodic_returns
+
+
+ppo_args = tyro.cli(Ppo_Args)
+run_name = f"{ppo_args.env_id}__{ppo_args.exp_name}__{ppo_args.seed}__{1758613366}"
+model_path = f"runs/{run_name}/{ppo_args.exp_name}.cleanrl_model"
+
+print('====================PPO===================')
+episodic_returns = evaluate_ppo(
+    model_path,
+    cleanrl.ppo_continuous_action.make_env,
+    ppo_args.env_id,
+    eval_episodes=10,
+    run_name=f"{run_name}-eval",
+    Model=cleanrl.ppo_continuous_action.Agent,
+    device=device,
+    gamma=ppo_args.gamma,
+    goal_position=LEFT_GOAL,
+    capture_video=False,
 )
