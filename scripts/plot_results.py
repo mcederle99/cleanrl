@@ -30,7 +30,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-FILENAME_RE = re.compile(r"^(?P<env>[^_]+)__(?P<sim>[^_][^_]*)__(?P<seed>\d+)__\d+\.csv$")
+# Accept filenames like: <env>__<simulation>__<seed>__<timestamp>.csv
+# - <env>: no underscores
+# - <simulation>: may contain single underscores but not double underscores
+# - <seed>: digits
+# - <timestamp>: digits
+FILENAME_RE = re.compile(
+    r"^(?P<env>[^_]+)__(?P<sim>[^_]+(?:_[^_]+)*)__(?P<seed>\d+)__\d+\.csv$"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,13 +45,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="/home/matteocederle/cleanrl/results_data",
+        default="results_data",
         help="Directory containing CSV result files",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="/home/matteocederle/cleanrl/results_data/plot.png",
+        default="results_data/plot.png",
         help="Path to save the generated plot",
     )
     parser.add_argument(
